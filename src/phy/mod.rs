@@ -91,6 +91,8 @@ use time::Instant;
 mod sys;
 
 mod tracer;
+#[cfg(any(feature = "std", feature = "alloc"))]
+mod kill_switch;
 mod fault_injector;
 mod pcap_writer;
 #[cfg(any(feature = "std", feature = "alloc"))]
@@ -104,6 +106,7 @@ mod tap_interface;
 pub use self::sys::wait;
 
 pub use self::tracer::Tracer;
+pub use self::kill_switch::KillSwitch;
 pub use self::fault_injector::FaultInjector;
 pub use self::pcap_writer::{PcapLinkType, PcapMode, PcapSink, PcapWriter};
 #[cfg(any(feature = "std", feature = "alloc"))]
