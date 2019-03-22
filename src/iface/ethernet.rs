@@ -438,13 +438,15 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
     pub fn poll(&mut self, sockets: &mut SocketSet, timestamp: Instant) -> Result<bool> {
         let mut readiness_may_have_changed = false;
         loop {
-            let processed_any = self.socket_ingress(sockets, timestamp)?;
-            let emitted_any   = self.socket_egress(sockets, timestamp)?;
+            let ingress = self.socket_ingress(sockets, timestamp);
+            let egress = self.socket_egress(sockets, timestamp);
+
+	    let processed_any = ingress? | egress?;
 
             #[cfg(feature = "proto-igmp")]
             self.igmp_egress(timestamp)?;
 
-            if processed_any || emitted_any {
+            if processed_any {
                 readiness_may_have_changed = true;
             } else {
                 break
@@ -527,6 +529,7 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
         for mut socket in sockets.iter_mut() {
             if !socket.meta_mut().egress_permitted(|ip_addr|
                     self.inner.has_neighbor(&ip_addr, timestamp)) {
+		    // eprintln!("Some remote still unknown, not permitted to send");
                 continue
             }
 
