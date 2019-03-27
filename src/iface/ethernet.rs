@@ -326,6 +326,10 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
         InterfaceInner::check_ethernet_addr(&self.inner.ethernet_addr);
     }
 
+    pub fn phy(&self) -> &DeviceT {
+        &self.device
+    }
+
     /// Add an address to a list of subscribed multicast IP addresses.
     ///
     /// Returns `Ok(announce_sent)` if the address was added successfully, where `annouce_sent`

@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use Result;
 use wire::pretty_print::{PrettyPrint, PrettyPrinter};
 use phy::{self, DeviceCapabilities, Device};
@@ -85,5 +87,13 @@ impl<Tx: phy::TxToken, P: PrettyPrint> phy::TxToken for TxToken<Tx, P> {
             writer(timestamp, PrettyPrinter::<P>::new("-> ", &buffer));
             result
         })
+    }
+}
+
+impl<D: for<'a> Device<'a>, P: PrettyPrint> Deref for Tracer<D, P> {
+    type Target = D;
+
+    fn deref(&self) -> &D {
+        &self.inner
     }
 }

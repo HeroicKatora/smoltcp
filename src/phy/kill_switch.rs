@@ -1,5 +1,6 @@
-use std::rc::Rc;
 use std::cell::RefCell;
+use std::ops::Deref;
+use std::rc::Rc;
 
 use super::{Device, DeviceCapabilities};
 
@@ -68,5 +69,13 @@ impl<'a, P> Device<'a> for KillSwitch<P>
 
     fn capabilities(&self) -> DeviceCapabilities {
         self.inner.capabilities()
+    }
+}
+
+impl<P> Deref for KillSwitch<P> {
+    type Target = P;
+
+    fn deref(&self) -> &P {
+        &self.inner
     }
 }
