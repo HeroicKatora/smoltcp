@@ -60,6 +60,8 @@ use super::Routes;
 pub struct Interface<'b, 'c, 'e, DeviceT: for<'d> Device<'d>> {
     device: DeviceT,
     inner:  InterfaceInner<'b, 'c, 'e>,
+    /// Maximum number of packets to receive and send at once.
+    burst: usize,
 }
 
 /// The device independent part of an Ethernet network interface.
@@ -105,6 +107,8 @@ pub struct InterfaceBuilder <'b, 'c, 'e, DeviceT: for<'d> Device<'d>> {
 
 impl<'b, 'c, 'e, DeviceT> InterfaceBuilder<'b, 'c, 'e, DeviceT>
         where DeviceT: for<'d> Device<'d> {
+    const DEFAULT_BURST: usize = 256;
+
     /// Create a builder used for creating a network interface using the
     /// given device and address.
     ///
@@ -259,7 +263,8 @@ impl<'b, 'c, 'e, DeviceT> InterfaceBuilder<'b, 'c, 'e, DeviceT>
                         _ipv4_multicast_groups:  PhantomData,
                         #[cfg(feature = "proto-igmp")]
                         igmp_report_state: IgmpReportState::Inactive,
-                    }
+                    },
+                    burst: Self::DEFAULT_BURST,
                 }
             },
             _ => panic!("a required option was not set"),
@@ -463,21 +468,13 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
     /// a very common occurrence and on a production system it should not even
     /// be logged.
     pub fn poll(&mut self, sockets: &mut SocketSet, timestamp: Instant) -> Result<bool> {
-        let mut readiness_may_have_changed = false;
-        loop {
-            let processed_any = self.socket_ingress(sockets, timestamp)?;
-            let emitted_any   = self.socket_egress(sockets, timestamp)?;
+        let processed_any = self.socket_ingress(sockets, timestamp)?;
+        let emitted_any   = self.socket_egress(sockets, timestamp)?;
 
-            #[cfg(feature = "proto-igmp")]
-            self.igmp_egress(timestamp)?;
+        #[cfg(feature = "proto-igmp")]
+        self.igmp_egress(timestamp)?;
 
-            if processed_any || emitted_any {
-                readiness_may_have_changed = true;
-            } else {
-                break
-            }
-        }
-        Ok(readiness_may_have_changed)
+        Ok(processed_any || emitted_any)
     }
 
     /// Return a _soft deadline_ for calling [poll] the next time.
@@ -522,8 +519,8 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
 
     fn socket_ingress(&mut self, sockets: &mut SocketSet, timestamp: Instant) -> Result<bool> {
         let mut processed_any = false;
-        loop {
-            let &mut Self { ref mut device, ref mut inner } = self;
+        for _ in 0..self.burst {
+            let &mut Self { ref mut device, ref mut inner, .. } = self;
             let (rx_token, tx_token) = match device.receive() {
                 None => break,
                 Some(tokens) => tokens,
@@ -551,74 +548,82 @@ impl<'b, 'c, 'e, DeviceT> Interface<'b, 'c, 'e, DeviceT>
         caps.max_transmission_unit -= EthernetFrame::<&[u8]>::header_len();
 
         let mut emitted_any = false;
-        for mut socket in sockets.iter_mut() {
-            if !socket.meta_mut().egress_permitted(|ip_addr|
-                    self.inner.has_neighbor(&ip_addr, timestamp)) {
-                continue
+        let mut remaining = self.burst;
+        loop {
+            for mut socket in sockets.iter_mut() {
+                remaining = remaining.saturating_sub(1);
+                if !socket.meta_mut().egress_permitted(|ip_addr|
+                        self.inner.has_neighbor(&ip_addr, timestamp)) {
+                    continue
+                }
+
+                let mut neighbor_addr = None;
+                let mut device_result = Ok(());
+                let &mut Self { ref mut device, ref mut inner, .. } = self;
+
+                macro_rules! respond {
+                    ($response:expr) => ({
+                        let response = $response;
+                        neighbor_addr = response.neighbor_addr();
+                        let tx_token = device.transmit().ok_or(Error::Exhausted)?;
+                        device_result = inner.dispatch(tx_token, timestamp, response);
+                        device_result
+                    })
+                }
+
+                let socket_result =
+                    match *socket {
+                        #[cfg(feature = "socket-raw")]
+                        Socket::Raw(ref mut socket) =>
+                            socket.dispatch(&caps.checksum, |response|
+                                respond!(Packet::Raw(response))),
+                        #[cfg(all(feature = "socket-icmp", any(feature = "proto-ipv4", feature = "proto-ipv6")))]
+                        Socket::Icmp(ref mut socket) =>
+                            socket.dispatch(&caps, |response| {
+                                match response {
+                                    #[cfg(feature = "proto-ipv4")]
+                                    (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) =>
+                                        respond!(Packet::Icmpv4((ipv4_repr, icmpv4_repr))),
+                                    #[cfg(feature = "proto-ipv6")]
+                                    (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) =>
+                                        respond!(Packet::Icmpv6((ipv6_repr, icmpv6_repr))),
+                                    _ => Err(Error::Unaddressable)
+                                }
+                            }),
+                        #[cfg(feature = "socket-udp")]
+                        Socket::Udp(ref mut socket) =>
+                            socket.dispatch(|response|
+                                respond!(Packet::Udp(response))),
+                        #[cfg(feature = "socket-tcp")]
+                        Socket::Tcp(ref mut socket) =>
+                            socket.dispatch(timestamp, &caps, |response|
+                                respond!(Packet::Tcp(response))),
+                        Socket::__Nonexhaustive(_) => unreachable!()
+                    };
+
+                match (device_result, socket_result) {
+                    (Err(Error::Exhausted), _) => break,     // nowhere to transmit
+                    (Ok(()), Err(Error::Exhausted)) => (),   // nothing to transmit
+                    (Err(Error::Unaddressable), _) => {
+                        // `NeighborCache` already takes care of rate limiting the neighbor discovery
+                        // requests from the socket. However, without an additional rate limiting
+                        // mechanism, we would spin on every socket that has yet to discover its
+                        // neighboor.
+                        socket.meta_mut().neighbor_missing(timestamp,
+                            neighbor_addr.expect("non-IP response packet"));
+                        break
+                    }
+                    (Err(err), _) | (_, Err(err)) => {
+                        net_debug!("{}: cannot dispatch egress packet: {}",
+                                   socket.meta().handle, err);
+                        return Err(err)
+                    }
+                    (Ok(()), Ok(())) => emitted_any = true
+                }
             }
 
-            let mut neighbor_addr = None;
-            let mut device_result = Ok(());
-            let &mut Self { ref mut device, ref mut inner } = self;
-
-            macro_rules! respond {
-                ($response:expr) => ({
-                    let response = $response;
-                    neighbor_addr = response.neighbor_addr();
-                    let tx_token = device.transmit().ok_or(Error::Exhausted)?;
-                    device_result = inner.dispatch(tx_token, timestamp, response);
-                    device_result
-                })
-            }
-
-            let socket_result =
-                match *socket {
-                    #[cfg(feature = "socket-raw")]
-                    Socket::Raw(ref mut socket) =>
-                        socket.dispatch(&caps.checksum, |response|
-                            respond!(Packet::Raw(response))),
-                    #[cfg(all(feature = "socket-icmp", any(feature = "proto-ipv4", feature = "proto-ipv6")))]
-                    Socket::Icmp(ref mut socket) =>
-                        socket.dispatch(&caps, |response| {
-                            match response {
-                                #[cfg(feature = "proto-ipv4")]
-                                (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) =>
-                                    respond!(Packet::Icmpv4((ipv4_repr, icmpv4_repr))),
-                                #[cfg(feature = "proto-ipv6")]
-                                (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) =>
-                                    respond!(Packet::Icmpv6((ipv6_repr, icmpv6_repr))),
-                                _ => Err(Error::Unaddressable)
-                            }
-                        }),
-                    #[cfg(feature = "socket-udp")]
-                    Socket::Udp(ref mut socket) =>
-                        socket.dispatch(|response|
-                            respond!(Packet::Udp(response))),
-                    #[cfg(feature = "socket-tcp")]
-                    Socket::Tcp(ref mut socket) =>
-                        socket.dispatch(timestamp, &caps, |response|
-                            respond!(Packet::Tcp(response))),
-                    Socket::__Nonexhaustive(_) => unreachable!()
-                };
-
-            match (device_result, socket_result) {
-                (Err(Error::Exhausted), _) => break,     // nowhere to transmit
-                (Ok(()), Err(Error::Exhausted)) => (),   // nothing to transmit
-                (Err(Error::Unaddressable), _) => {
-                    // `NeighborCache` already takes care of rate limiting the neighbor discovery
-                    // requests from the socket. However, without an additional rate limiting
-                    // mechanism, we would spin on every socket that has yet to discover its
-                    // neighboor.
-                    socket.meta_mut().neighbor_missing(timestamp,
-                        neighbor_addr.expect("non-IP response packet"));
-                    break
-                }
-                (Err(err), _) | (_, Err(err)) => {
-                    net_debug!("{}: cannot dispatch egress packet: {}",
-                               socket.meta().handle, err);
-                    return Err(err)
-                }
-                (Ok(()), Ok(())) => emitted_any = true
+            if remaining == 0 {
+                break
             }
         }
         Ok(emitted_any)
