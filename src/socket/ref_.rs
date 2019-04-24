@@ -32,8 +32,7 @@ impl<'a> Session for TcpSocket<'a> {}
 ///
 /// Allows the network stack to efficiently determine if the socket state was changed in any way.
 pub struct Ref<'a, T: Session + 'a> {
-    socket:   &'a mut T,
-    consumed: bool,
+    socket:   Option<&'a mut T>,
 }
 
 impl<'a, T: Session + 'a> Ref<'a, T> {
@@ -43,7 +42,7 @@ impl<'a, T: Session + 'a> Ref<'a, T> {
     ///
     /// [into_inner]: #method.into_inner
     pub fn new(socket: &'a mut T) -> Self {
-        Ref { socket, consumed: false }
+        Ref { socket: Some(socket), }
     }
 
     /// Unwrap a smart pointer to a socket.
@@ -57,8 +56,9 @@ impl<'a, T: Session + 'a> Ref<'a, T> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     pub fn into_inner(mut ref_: Self) -> &'a mut T {
-        ref_.consumed = true;
-        ref_.socket
+        // This unwrap will never panic, as this is the only point where we take the socket.
+        ref_.socket.take()
+            .unwrap_or_else(is_unreachable_due_to_inner_invariant)
     }
 }
 
@@ -66,20 +66,29 @@ impl<'a, T: Session> Deref for Ref<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.socket
+        self.socket.as_ref().map(|x| &**x)
+            .unwrap_or_else(is_unreachable_due_to_inner_invariant)
     }
 }
 
 impl<'a, T: Session> DerefMut for Ref<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.socket
+        self.socket.as_mut().map(|x| &mut**x)
+            .unwrap_or_else(is_unreachable_due_to_inner_invariant)
     }
 }
 
 impl<'a, T: Session> Drop for Ref<'a, T> {
     fn drop(&mut self) {
-        if !self.consumed {
-            Session::finish(self.socket);
+        if let Some(socket) = self.socket.take() {
+            Session::finish(socket);
         }
     }
+}
+
+#[inline(never)]
+#[cold]
+fn is_unreachable_due_to_inner_invariant<T>() -> T {
+    unreachable!("Only a previous call to into_inner can remove the contained reference.")
+    // `into_inner` will then instantly call `Drop`, which calls neither `into_inner` nor Deref.
 }
